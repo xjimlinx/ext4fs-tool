@@ -124,6 +124,13 @@ fn main() {
             }
             cmd_extract(&fs, pos[2].as_str(), pos[3].as_str())
         }
+        "copy" => {
+            if pos.len() < 4 {
+                eprintln!("usage: ext4fs-tool copy <image> <path> <destfile-or-dir>");
+                std::process::exit(2);
+            }
+            cmd_copy(&fs, pos[2].as_str(), pos[3].as_str())
+        }
         _ => {
             eprintln!("unknown command: {}", cmd);
             usage();
@@ -159,6 +166,15 @@ fn cmd_extract(fs: &Ext4, path: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_copy(fs: &Ext4, path: &str, dest: &str) -> Result<()> {
+    let (out, errors) = ext4fs_tool::ext4::copy::copy_to(fs, path, std::path::Path::new(dest))?;
+    println!("copied {} -> {}", path, out.display());
+    for e in &errors {
+        println!("  warn: {}", e);
+    }
+    Ok(())
+}
+
 fn cmd_devices() -> Result<()> {
     #[cfg(windows)]
     {
@@ -167,10 +183,14 @@ fn cmd_devices() -> Result<()> {
             println!("no physical disks found");
         }
         for d in disks {
-            println!("{}", d.path);
-            if let Some(sz) = d.size {
-                println!("  size: {} bytes", sz);
+            let mut head = d.path.clone();
+            if let Some(m) = &d.model {
+                head.push_str(&format!("   {}", m));
             }
+            if let Some(sz) = d.size {
+                head.push_str(&format!("   ({} bytes)", sz));
+            }
+            println!("{}", head);
             if let Some(err) = &d.error {
                 println!("  {}", err);
                 continue;
@@ -241,14 +261,23 @@ fn print_table(
                 None => "?".into(),
             }
         };
+        let label = {
+            let mut f = std::fs::File::open(device).ok();
+            let f = f.as_mut();
+            match f {
+                Some(f) => ext4fs_tool::ext4::partitions::detect_fs_label(f, start),
+                None => String::new(),
+            }
+        };
         let _ = writeln!(
             out,
-            "  #{} lba={} sectors={} bytes={} fs={} {}  {}",
+            "  #{} lba={} sectors={} bytes={} fs={} label={} {}  {}",
             p.index,
             p.start_lba,
             p.sectors,
             start,
             fs,
+            label,
             p.name,
             kind
         );
@@ -302,11 +331,13 @@ fn cmd_ls(fs: &Ext4, path: &str) -> Result<()> {
         return Err(ExtError::NotDir(ino));
     }
     let entries = fs.list_dir(&inode)?;
+    let inos: Vec<u32> = entries.iter().map(|e| e.ino).collect();
+    let inodes = fs.read_inodes_batch(&inos);
     let mut lines: Vec<(String, String)> = Vec::new();
-    for e in &entries {
-        let detail = match fs.read_inode(e.ino) {
-            Ok(i) => format!("{:>10} {}", i.size, type_char(&i)),
-            Err(_) => format!("{:>10} {}", 0, type_from_ft(e.file_type)),
+    for (e, ino_opt) in entries.iter().zip(inodes.iter()) {
+        let detail = match ino_opt {
+            Some(i) => format!("{:>10} {}", i.size, type_char(i)),
+            None => format!("{:>10} {}", 0, type_from_ft(e.file_type)),
         };
         lines.push((detail, e.name.clone()));
     }

@@ -5,6 +5,7 @@ use crate::ext4::error::ExtError;
 use crate::ext4::util::{u16, u32};
 use crate::ext4::Ext4;
 use crate::ext4::Result;
+use std::collections::{BTreeMap, HashMap};
 
 pub const EXT4_ROOT_INO: u32 = 2;
 pub const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
@@ -135,6 +136,42 @@ impl Ext4 {
         Ok(Inode::parse(&raw, ino))
     }
 
+    /// Read many inodes at once, batched by inode-table block. Returns one
+    /// `Option` per input inode (in the same order); `None` on read failure.
+    pub fn read_inodes_batch(&self, inos: &[u32]) -> Vec<Option<Inode>> {
+        let per_group = self.sb.inodes_per_group as u64;
+        let inode_size = self.sb.inode_size as u64;
+        let mut by_block: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        for &ino in inos {
+            if ino == 0 {
+                continue;
+            }
+            let n = ino as u64 - 1;
+            let group = (n / per_group) as usize;
+            if let Some(gd) = self.groups.get(group) {
+                let idx = n % per_group;
+                let byte = idx * inode_size;
+                let pblock = gd.inode_table + byte / self.block_size;
+                by_block.entry(pblock).or_default().push(ino);
+            }
+        }
+        let mut found: HashMap<u32, Inode> = HashMap::with_capacity(inos.len());
+        for (&pblock, block_inos) in &by_block {
+            if let Ok(blk) = self.read_block(pblock) {
+                for &ino in block_inos {
+                    let n = ino as u64 - 1;
+                    let idx = n % per_group;
+                    let off = (idx * inode_size) as usize;
+                    let end = off + inode_size as usize;
+                    if end <= blk.len() {
+                        found.insert(ino, Inode::parse(&blk[off..end], ino));
+                    }
+                }
+            }
+        }
+        inos.iter().map(|i| found.get(i).cloned()).collect()
+    }
+
     /// Read inline file data stored inside the inode itself.
     pub fn inline_data(&self, inode: &Inode) -> Result<Vec<u8>> {
         let raw = self.read_inode_raw(inode.ino)?;
@@ -185,6 +222,132 @@ pub fn read_inode_data(fs: &Ext4, inode: &Inode, out: &mut Vec<u8>) -> Result<()
         }
         remaining -= chunk as u64;
         logical += 1;
+    }
+    Ok(())
+}
+
+/// Stream an inode's data through a callback in large chunks (up to 1 MiB),
+/// reading contiguous physical runs in a single I/O. Handles holes, inline
+/// data and fast symlinks. Callback errors abort the read.
+pub fn read_inode_data_chunks<F>(
+    fs: &Ext4,
+    inode: &Inode,
+    mut chunk_cb: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]) -> std::io::Result<()>,
+{
+    if inode.flags & EXT4_INLINE_DATA_FL != 0 {
+        let data = fs.inline_data(inode)?;
+        chunk_cb(&data)?;
+        return Ok(());
+    }
+    if inode.is_fast_symlink() {
+        chunk_cb(&inode.block_raw[..inode.size as usize])?;
+        return Ok(());
+    }
+
+    let block_size = fs.block_size;
+    let size = inode.size;
+    if size == 0 {
+        return Ok(());
+    }
+    let total_blocks = (size + block_size - 1) / block_size;
+    let max_run = ((1024 * 1024) / block_size).max(1);
+    let mut remaining = size;
+    let mut logical = 0u64;
+    let zeros_buf = vec![0u8; block_size as usize];
+    while logical < total_blocks {
+        match fs.block_to_paddr(inode, logical)? {
+            Some(phys) => {
+                // extend the run over consecutive logical+physical blocks
+                let mut run = 1u64;
+                while run < max_run && logical + run < total_blocks {
+                    match fs.block_to_paddr(inode, logical + run)? {
+                        Some(p) if p == phys + run => run += 1,
+                        _ => break,
+                    }
+                }
+                // Always read whole (sector-aligned) blocks: raw disk devices on
+                // Windows reject unaligned reads with ERROR_INVALID_PARAMETER.
+                let read_bytes = (run * block_size) as usize;
+                let data = fs.read_bytes_at(phys * block_size, read_bytes)?;
+                let take = remaining.min(read_bytes as u64) as usize;
+                chunk_cb(&data[..take])?;
+                logical += run;
+                remaining -= take as u64;
+            }
+            None => {
+                let bytes = block_size.min(remaining) as usize;
+                chunk_cb(&zeros_buf[..bytes])?;
+                logical += 1;
+                remaining -= bytes as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Like [`read_inode_data_chunks`] but reads through a caller-provided file
+/// handle instead of the filesystem's shared handle. Used by parallel copy
+/// workers so each thread reads with its own handle.
+pub fn read_inode_data_chunks_handle<F>(
+    fs: &Ext4,
+    inode: &Inode,
+    file: &mut std::fs::File,
+    mut chunk_cb: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]) -> std::io::Result<()>,
+{
+    use std::io::{Read, Seek, SeekFrom};
+
+    if inode.flags & EXT4_INLINE_DATA_FL != 0 {
+        let data = fs.inline_data(inode)?;
+        chunk_cb(&data)?;
+        return Ok(());
+    }
+    if inode.is_fast_symlink() {
+        chunk_cb(&inode.block_raw[..inode.size as usize])?;
+        return Ok(());
+    }
+
+    let block_size = fs.block_size;
+    let size = inode.size;
+    if size == 0 {
+        return Ok(());
+    }
+    let total_blocks = (size + block_size - 1) / block_size;
+    let max_run = ((1024 * 1024) / block_size).max(1);
+    let mut remaining = size;
+    let mut logical = 0u64;
+    let zeros_buf = vec![0u8; block_size as usize];
+    while logical < total_blocks {
+        match fs.block_to_paddr(inode, logical)? {
+            Some(phys) => {
+                let mut run = 1u64;
+                while run < max_run && logical + run < total_blocks {
+                    match fs.block_to_paddr(inode, logical + run)? {
+                        Some(p) if p == phys + run => run += 1,
+                        _ => break,
+                    }
+                }
+                let read_bytes = (run * block_size) as usize;
+                file.seek(SeekFrom::Start(fs.start + phys * block_size))?;
+                let mut data = vec![0u8; read_bytes];
+                file.read_exact(&mut data)?;
+                let take = remaining.min(read_bytes as u64) as usize;
+                chunk_cb(&data[..take])?;
+                logical += run;
+                remaining -= take as u64;
+            }
+            None => {
+                let bytes = block_size.min(remaining) as usize;
+                chunk_cb(&zeros_buf[..bytes])?;
+                logical += 1;
+                remaining -= bytes as u64;
+            }
+        }
     }
     Ok(())
 }

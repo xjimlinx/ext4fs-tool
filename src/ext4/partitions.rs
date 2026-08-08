@@ -142,6 +142,51 @@ pub fn detect_fs(file: &mut File, offset: u64) -> String {
     "unknown".into()
 }
 
+/// Read the volume label of the filesystem starting at `offset`.
+pub fn detect_fs_label(file: &mut File, offset: u64) -> String {
+    let mut buf = vec![0u8; 2048];
+    let n = match file.seek(SeekFrom::Start(offset)).and_then(|_| file.read(&mut buf)) {
+        Ok(n) => n,
+        Err(_) => return String::new(),
+    };
+    let label_ascii = |from: usize, len: usize| {
+        let end = buf[from..(from + len).min(buf.len())]
+            .iter()
+            .position(|&c| c == 0)
+            .map(|i| from + i)
+            .unwrap_or(from + len);
+        String::from_utf8_lossy(&buf[from..end]).trim().to_string()
+    };
+    // NTFS / exFAT store the label as UTF-16LE.
+    let label_utf16 = |from: usize, max_chars: usize| {
+        let mut units: Vec<u16> = Vec::new();
+        let mut i = from;
+        while i + 1 < buf.len() && units.len() < max_chars {
+            let u = u16::from_le_bytes([buf[i], buf[i + 1]]);
+            if u == 0 {
+                break;
+            }
+            units.push(u);
+            i += 2;
+        }
+        String::from_utf16_lossy(&units).trim().to_string()
+    };
+    if n > 1082 && u16(&buf, 1024 + 56) == 0xEF53 {
+        return label_ascii(1024 + 120, 16); // ext4 s_volume_name
+    }
+    let has = |from: usize, pat: &[u8]| n >= from + pat.len() && buf[from..from + pat.len()] == *pat;
+    if has(3, b"NTFS    ") {
+        return label_utf16(72, 11); // NTFS volume label
+    }
+    if has(3, b"EXFAT") {
+        return label_utf16(107, 11); // exFAT volume label
+    }
+    if has(82, b"FAT32   ") || has(54, b"FAT16   ") || has(54, b"FAT12   ") {
+        return label_ascii(43, 11); // FAT volume label
+    }
+    String::new()
+}
+
 fn decode_utf16(b: &[u8]) -> String {
     let units: Vec<u16> = b
         .chunks_exact(2)
@@ -149,4 +194,40 @@ fn decode_utf16(b: &[u8]) -> String {
         .take_while(|&u| u != 0)
         .collect();
     String::from_utf16_lossy(&units)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn with_boot_sector(tag: &str, patch: &dyn Fn(&mut [u8])) -> String {
+        let mut bs = vec![0u8; 2048];
+        patch(&mut bs);
+        let path = std::env::temp_dir().join(format!("ext4fs_{}_test.bin", tag));
+        std::fs::File::create(&path).unwrap().write_all(&bs).unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        let s = detect_fs_label(&mut f, 0);
+        let _ = std::fs::remove_file(&path);
+        s
+    }
+
+    #[test]
+    fn ntfs_label_is_utf16() {
+        let label = with_boot_sector("ntfs", &|bs| {
+            bs[3..11].copy_from_slice(b"NTFS    ");
+            let bytes: Vec<u8> = "Windows 数据".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            bs[72..72 + bytes.len()].copy_from_slice(&bytes);
+        });
+        assert_eq!(label, "Windows 数据");
+    }
+
+    #[test]
+    fn fat_label_is_ascii() {
+        let label = with_boot_sector("fat", &|bs| {
+            bs[82..90].copy_from_slice(b"FAT32   ");
+            bs[43..49].copy_from_slice(b"MYDATA");
+        });
+        assert_eq!(label, "MYDATA");
+    }
 }

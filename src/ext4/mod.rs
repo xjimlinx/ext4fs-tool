@@ -24,6 +24,7 @@ use self::inode::{read_inode_data, EXT4_ROOT_INO};
 
 pub struct Ext4 {
     file: Mutex<File>,
+    path: String,
     pub start: u64,
     pub sb: Superblock,
     pub block_size: u64,
@@ -59,6 +60,7 @@ impl Ext4 {
 
         Ok(Ext4 {
             file: Mutex::new(file),
+            path: path.to_string(),
             start,
             sb,
             block_size,
@@ -66,6 +68,13 @@ impl Ext4 {
             desc_size,
             is_64bit,
         })
+    }
+
+    /// Open an independent handle to the same source, for parallel readers.
+    /// Each thread gets its own handle so reads are not serialized by the
+    /// internal `Mutex<File>`.
+    pub fn open_independent_handle(&self) -> std::io::Result<File> {
+        File::open(&self.path)
     }
 
     /// Read raw bytes at a filesystem-absolute offset.
